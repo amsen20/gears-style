@@ -7,73 +7,68 @@ import gears.async.ChannelMultiplexer
 import scala.util.Try
 import scala.util.Failure
 import scala.util.Success
+import scala.collection.mutable
+import gears.async.ReadableChannel
+import gears.async.SendableChannel
 
 object Pipeline {
-  def generator[T](values: T*)(using Async): (Channel[T], Future[Unit]) =
-    val channel = SyncChannel[T]()
+  type Stage[T] = (ReadableChannel[T], SyncChannel[T]) => Async ?=> Unit
+  type Generator[T] = SyncChannel[T] => Async ?=> Unit
 
-    val f = Future:
+  def generator[T](values: T*): Generator[T] =
+    out =>
       try
-        values.foreach(channel.send(_))
+        values.foreach(out.send(_))
       finally
-        channel.close()
+        out.close()
 
-    (channel, f)
-
-  def applyBinOp[T](binOp: (T, T) => T, intStream: Channel[T], by: T)(using
-      Async
-  ): Channel[T] =
-    val resultStream = SyncChannel[T]()
-
-    Future:
-      var isOpen = true
-      while isOpen do
-        intStream.read() match
-          case Left(_)  => isOpen = false
-          case Right(v) => resultStream.send(binOp(v, by))
-
-      resultStream.close()
-
-    resultStream
-
-  type Stage[T] = Channel[T] => Channel[T]
-  def scale[T](stage: Stage[T], num: Int)(using Async): Stage[T] =
-    inputStream =>
-      val proxyOutputStream = SyncChannel[Try[T]]()
-      val multiplexer = ChannelMultiplexer[T]()
-      multiplexer.addSubscriber(proxyOutputStream)
-
-      val proxyInputStream = SyncChannel[T]()
-      Future:
+  def applyBinOp[T](binOp: (T, T) => T, by: T): Stage[T] =
+    (in, out) =>
+      try
         var isOpen = true
         while isOpen do
-          inputStream.read() match
+          in.read() match
             case Left(_)  => isOpen = false
-            case Right(v) => proxyInputStream.send(v)
+            case Right(v) => out.send(binOp(v, by))
+      finally out.close()
 
-        proxyInputStream.close()
-        // FIXME Uncommenting following code results in failure
-        // multiplexer.close()
+  extension [T](stage: Stage[T])
+    def >>(otherStage: Stage[T]): Stage[T] =
+      (in, out) =>
+        val connection = SyncChannel[T]()
+        val f = Future(stage(in, connection))
+        otherStage(connection, out)
 
-      (0 until num).foreach(_ =>
-        Future:
-          val stageOutputStream = stage(proxyInputStream)
-          multiplexer.addPublisher(stageOutputStream)
-      )
+        f.await
 
-      val outputStream = SyncChannel[T]()
+    def *(num: Int): Stage[T] =
+      (in, out) =>
+        try
+          val (outs, stages) =
+            (0 until num)
+              .map: _ =>
+                val out = SyncChannel[T]()
+                (out, Future(stage(in, out)))
+              .unzip
+          var streams = mutable.Set(outs*)
+          while !streams.isEmpty do
+            Async.select(
+              streams.toSeq.map(stream =>
+                stream.readSource handle:
+                  case Left(_)  => streams -= stream
+                  case Right(v) => out.send(v)
+              )*
+            )
 
-      Future:
-        var isOpen = true
-        while isOpen do
-          proxyOutputStream.read() match
-            case Left(_) | Right(Failure(_)) => isOpen = false
-            case Right(Success(v))           => outputStream.send(v)
+          stages.awaitAll
+        finally out.close()
 
-        outputStream.close()
+  extension [T](generator: Generator[T])
+    def >>(stage: Stage[T]): Generator[T] =
+      out =>
+        val connection = SyncChannel[T]()
+        val genFuture = Future(generator(connection))
+        stage(connection, out)
 
-      Future:
-        multiplexer.run()
-
-      outputStream
+        genFuture.await
 }

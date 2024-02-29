@@ -1,4 +1,3 @@
-import munit.Clue.generate
 import org.scalacheck.Prop.forAll
 import gears.async.Future
 import gears.async.Async
@@ -10,37 +9,41 @@ import gears.async.default.given
 
 import scala.concurrent.ExecutionContext
 import scala.util.Success
-import Pipeline.scale
+import gears.async.SyncChannel
+import Pipeline.>>
+import Pipeline.*
 
-class PiplelineSuite extends munit.FunSuite {
+class PipelineSuite extends munit.FunSuite {
   given ExecutionContext = ExecutionContext.global
+
+  val simplePipeline =
+    (ls: List[Int]) =>
+      Pipeline.generator(ls*) >>
+        Pipeline.applyBinOp[Int](_ * _, 2) >>
+        Pipeline.applyBinOp[Int](_ + _, 10)
 
   test("simple pipeline") {
     Async.blocking:
-      val stagePlus10 = stream => Pipeline.applyBinOp[Int](_ + _, stream, 10)
-      val stageMul2 = stream => Pipeline.applyBinOp[Int](_ * _, stream, 2)
-      val pipeline = stageMul2 andThen stagePlus10
-
       val ls = List(1, 2, 3, 4, 5)
-      val (inputStream, _) = Pipeline.generator(ls: _*)
-      val outputStream = pipeline(inputStream)
+
+      val outputStream = SyncChannel[Int]()
+      val f = Future(simplePipeline(ls)(outputStream))
 
       for (x <- ls)
       do
         outputStream.read() match
           case Left(_)  => fail("Unexpected end of stream")
           case Right(v) => assertEquals(v, x * 2 + 10)
+
+      f.await
   }
 
   test("pipeline cancellation") {
     Async.blocking:
-      val stagePlus10 = stream => Pipeline.applyBinOp[Int](_ + _, stream, 10)
-      val stageMul2 = stream => Pipeline.applyBinOp[Int](_ * _, stream, 2)
-      val pipeline = stageMul2 andThen stagePlus10
-
       val ls = List(1, 2, 3, 4, 5)
-      val (inputStream, generatorFuture) = Pipeline.generator(ls: _*)
-      val outputStream = pipeline(inputStream)
+
+      val outputStream = SyncChannel[Int]()
+      val f = Future(simplePipeline(ls)(outputStream))
 
       val lls = ls.slice(0, ls.length / 2)
       for (x <- lls)
@@ -49,7 +52,7 @@ class PiplelineSuite extends munit.FunSuite {
           case Left(_)  => fail("Unexpected end of stream")
           case Right(v) => assertEquals(v, x * 2 + 10)
 
-      generatorFuture.cancel()
+      f.cancel()
       outputStream.read()
 
       outputStream.read() match
@@ -57,19 +60,17 @@ class PiplelineSuite extends munit.FunSuite {
         case Right(v) => println(v); fail(s"Expected end of stream but got $v")
   }
 
-  def delayedPlus(a: Int, b: Int)(using Async) =
-    AsyncOperations.sleep(1000)
-    a + b
-
   test("scaled pipeline output") {
     Async.blocking:
-      val stagePlus10 = stream => Pipeline.applyBinOp[Int](_ + _, stream, 10)
-      val stageMul2 = stream => Pipeline.applyBinOp[Int](_ * _, stream, 2)
-      val pipeline = stageMul2 andThen scale(stagePlus10, 10)
+      val myPipeline =
+        (ls: List[Int]) =>
+          Pipeline.generator(ls*) >>
+            Pipeline.applyBinOp[Int](_ * _, 2) * ls.length >>
+            Pipeline.applyBinOp[Int](_ + _, 10)
 
       val ls = List(1, 2, 3, 4, 5)
-      val (inputStream, _) = Pipeline.generator(ls: _*)
-      val outputStream = pipeline(inputStream)
+      val outputStream = SyncChannel[Int]()
+      val f = Future(simplePipeline(ls)(outputStream))
 
       var outputSet = Set.empty[Int]
 
@@ -79,5 +80,50 @@ class PiplelineSuite extends munit.FunSuite {
           case Right(v) => outputSet += v
 
       assertEquals(outputSet, ls.map(_ * 2 + 10).to(Set))
+  }
+
+  test("scaled pipeline being parallelized") {
+    Async.blocking:
+      val start = System.currentTimeMillis()
+      val DELAY = 100
+
+      def delayStage[T](stage: Stage[T], amount: Long): Stage[T] =
+        (in, out) =>
+          val connection = SyncChannel[T]()
+          val f = Future(stage(connection, out))
+          try
+            var isOpen = true
+            while isOpen do
+              in.read() match
+                case Left(_) => isOpen = false
+                case Right(v) =>
+                  AsyncOperations.sleep(amount)
+                  connection.send(v)
+          finally connection.close()
+          f.await
+
+      val myPipeline =
+        (ls: List[Int]) =>
+          Pipeline.generator(ls*) >>
+            delayStage(Pipeline.applyBinOp[Int](_ * _, 2), DELAY) * ls.length >>
+            Pipeline.applyBinOp[Int](_ + _, 10)
+
+      val ls = List(1, 2, 3, 4, 5)
+      val outputStream = SyncChannel[Int]()
+      val f = Future(myPipeline(ls)(outputStream))
+
+      var outputSet = Set.empty[Int]
+
+      for (_ <- (0 until 5)) do
+        outputStream.read() match
+          case Left(_)  => fail("Unexpected end of stream")
+          case Right(v) => outputSet += v
+
+      assertEquals(outputSet, ls.map(_ * 2 + 10).to(Set))
+
+      f.await
+
+      val end = System.currentTimeMillis()
+      assert(end - start < DELAY * 2)
   }
 }
