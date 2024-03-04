@@ -4,8 +4,8 @@ import gears.async.AsyncOperations
 import RateLimiter.Limiter
 
 trait RateLimiter {
-  def Wait: AsyncOperations ?=> Async ?=> Unit
-  def WaitN(n: Int): AsyncOperations ?=> Async ?=> Unit
+  def Wait(using AsyncOperations, Async): Unit
+  def WaitN(n: Int)(using AsyncOperations, Async): Unit
 }
 
 object RateLimiter {
@@ -18,7 +18,7 @@ object RateLimiter {
       while pastRequests.nonEmpty && pastRequests.head < now - period do
         pastRequests.dequeue()
 
-    def Wait =
+    def Wait(using AsyncOperations, Async): Unit =
       synchronized {
         relaxQueue
         while pastRequests.length >= expectedThroughput do
@@ -30,7 +30,7 @@ object RateLimiter {
         pastRequests.enqueue(System.currentTimeMillis())
       }
 
-    def WaitN(n: Int) =
+    def WaitN(n: Int)(using AsyncOperations, Async): Unit =
       for _ <- 0 until n do Wait
   }
 
